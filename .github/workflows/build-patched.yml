@@ -1,0 +1,586 @@
+# ============================================================================
+# build-patched.yml — SukiSU-Nova（KernelSU 系）二次开发流水线
+#
+# 用途：把 patches/ 下的补丁打进 kernel/，编出可直接刷进 init_boot 的 LKM，
+#       可选重新打包 manager APK。
+#
+# 结构来源（不是凭空编的）：
+#   上游仓库  SukiSU-Nova/SukiSU-Nova（原 SukiSU-Ultra/SukiSU-Ultra，仓库 id 957055748）
+#   参考文件  .github/workflows/build-lkm.yml   （KMI 矩阵扇出）
+#             .github/workflows/ddk-lkm.yml     （真正编 kernelsu.ko 的地方）
+#             .github/workflows/manager.yml     （打 APK、随机化、repack 签名）
+#             .github/workflows/ci.yml          （总编排：lkm → ksud → manager）
+#   本文件保留上游的编译命令、容器镜像、目录变量、产物命名；
+#   只把上游"自建 runner"专用的部分（/ci/tools、/ci/repo-cache、CNB artifact
+#   服务、git.zako.shirkneko.top 内部镜像）替换成 GitHub 托管 runner 的原语：
+#   actions/checkout + actions/upload-artifact + secrets。
+#
+# 关键事实（来自 ddk-min:android16-6.12-20260828 镜像的 config blob，已核实）：
+#   ENV ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- LLVM=1 LLVM_IAS=1
+#       KDIR=/opt/ddk/kdir/android16-6.12
+#       KERNEL_SRC=/opt/ddk/kdir/android16-6.12
+#       CLANG_PATH=/opt/ddk/clang/clang-r536225/bin
+#   => 容器里不需要自己准备 KDIR / 交叉工具链，直接 cd kernel && make 即可。
+#
+# 版本号：kernel/Kbuild 里
+#   KSU_VERSION := 30000 + LOCAL_COUNT + 996
+#   LOCAL_COUNT 优先取上游 Forgejo API 的 X-Total-Count，取不到再退回
+#   git rev-list --count（无 .git 时为空 → KSU_VERSION 掉回 30000）。
+#   所以必须显式传 KSU_VERSION=<version_code>，否则编出来的 ko 和已装
+#   manager（ksud 35079）版本对不上，manager 会提示内核模块版本不匹配。
+# ============================================================================
+
+name: Build patched LKM (SukiSU)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kmi:
+        description: 'KMI 版本（必须与设备 6.12.69-android16 对应）'
+        required: true
+        default: 'android16-6.12'
+        type: choice
+        options:
+          - android16-6.12
+          - android17-6.18
+          - android15-6.6
+          - android14-6.1
+          - android14-5.15
+          - android13-5.15
+      ddk_release:
+        description: 'DDK 镜像版本（ghcr.io/ylarod/ddk-min:<kmi>-<ddk_release>）'
+        required: true
+        default: '20260828'
+        type: string
+      version_code:
+        description: 'KSU_VERSION（留空=按 git 提交数算；设备当前 ksud 是 35079）'
+        required: false
+        default: '35079'
+        type: string
+      expected_vermagic:
+        description: '产物 vermagic 精确期望值（留空=只校验 KMI 前缀；设备侧由 ksud 安装时对齐）'
+        required: false
+        default: ''
+        type: string
+      patch_dir:
+        description: '补丁目录（仓库内相对路径，*.patch 按文件名顺序应用）'
+        required: true
+        default: 'patches'
+        type: string
+      arch:
+        description: '编译哪些架构'
+        required: true
+        default: 'aarch64'
+        type: choice
+        options:
+          - aarch64
+          - x86_64
+          - both
+      kpm:
+        description: 'CONFIG_KPM（本机 kpm NOT_SUPPORTED，保持 false 更接近现状）'
+        required: true
+        default: false
+        type: boolean
+      expected_size:
+        description: 'KSU_EXPECTED_SIZE（留空=上游默认 0x35c，对应官方 CI 签名）'
+        required: false
+        default: ''
+        type: string
+      expected_hash:
+        description: 'KSU_EXPECTED_HASH（留空=上游默认；自签 manager 必须改成其证书指纹）'
+        required: false
+        default: ''
+        type: string
+      build_manager:
+        description: '是否重打 manager APK（签名不匹配时无法覆盖安装，见 README）'
+        required: true
+        default: false
+        type: boolean
+      keystore_b64:
+        description: 'APK 签名用 keystore（base64 单行）；留空=自签临时 key'
+        required: false
+        default: ''
+        type: string
+      keystore_password:
+        description: 'keystore 密码'
+        required: false
+        default: ''
+        type: string
+      key_alias:
+        description: 'key alias'
+        required: false
+        default: ''
+        type: string
+      key_password:
+        description: 'key 密码'
+        required: false
+        default: ''
+        type: string
+  push:
+    branches: [ lkm-ci ]
+    paths:
+      - 'patches/**'
+      - '.github/workflows/build-patched.yml'
+      - 'kernel/**'
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: patched-lkm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 上游固定这两个值；改 KMI 时镜像 tag 跟着变。
+  DEFAULT_DDK_RELEASE: '20260828'
+
+jobs:
+  # ==========================================================================
+  # 1) 预检：KMI 白名单、补丁能否 apply、版本号定档
+  #    上游用 determine-version job 做同类事（ci.yml:141）。
+  # ==========================================================================
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-latest
+    outputs:
+      version_code: ${{ steps.ver.outputs.version_code }}
+      patch_count: ${{ steps.patches.outputs.patch_count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 版本号要用提交数，别用浅克隆。
+          fetch-depth: 0
+
+      - name: 校验 KMI 与镜像 tag 存在
+        env:
+          KMI: ${{ inputs.kmi || 'android16-6.12' }}
+          DDK_RELEASE: ${{ inputs.ddk_release || '20260828' }}
+        run: |
+          set -eux
+          case "$KMI" in
+            android12-5.10|android13-5.10|android13-5.15|android14-5.15|android14-6.1|android15-6.6|android16-6.12|android17-6.18) ;;
+            *) echo "::error::未知 KMI: $KMI"; exit 1 ;;
+          esac
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:ylarod/ddk-min:pull&service=ghcr.io" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            "https://ghcr.io/v2/ylarod/ddk-min/manifests/${KMI}-${DDK_RELEASE}")
+          echo "ghcr.io/ylarod/ddk-min:${KMI}-${DDK_RELEASE} -> HTTP $code"
+          test "$code" = "200"
+
+      - name: 校验补丁存在且可应用
+        id: patches
+        env:
+          PATCH_DIR: ${{ inputs.patch_dir || 'patches' }}
+        run: |
+          set -eux
+          shopt -s nullglob
+          patches=("$PATCH_DIR"/*.patch)
+          test "${#patches[@]}" -gt 0 || { echo "::error::$PATCH_DIR 下没有 *.patch"; exit 1; }
+          for p in "${patches[@]}"; do
+            if git apply --reverse --check "$p" 2>/dev/null; then
+              echo "已应用（跳过）：$p"
+            else
+              git apply --check --verbose "$p"
+              echo "可应用：$p"
+            fi
+          done
+          echo "patch_count=${#patches[@]}" >> "$GITHUB_OUTPUT"
+          ls -la "$PATCH_DIR"
+
+      - name: 定版本号
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version_code || '' }}
+        run: |
+          set -eux
+          if [ -n "$INPUT_VERSION" ]; then
+            v="$INPUT_VERSION"
+          else
+            # 与 kernel/Kbuild 的 30000 + count + 996 对齐
+            count=$(git rev-list --count HEAD)
+            v=$((30000 + count + 996))
+          fi
+          echo "version_code=$v" >> "$GITHUB_OUTPUT"
+          echo "KSU_VERSION = $v"
+
+  # ==========================================================================
+  # 2) aarch64 LKM：复刻上游 ddk-lkm.yml 的 "Build kernelsu.ko" 步骤
+  # ==========================================================================
+  lkm-aarch64:
+    name: LKM ${{ inputs.kmi || 'android16-6.12' }} aarch64
+    needs: preflight
+    if: ${{ (inputs.arch || 'aarch64') != 'x86_64' }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ inputs.kmi || 'android16-6.12' }}-${{ inputs.ddk_release || '20260828' }}
+      options: --privileged
+    env:
+      KMI: ${{ inputs.kmi || 'android16-6.12' }}
+      PATCH_DIR: ${{ inputs.patch_dir || 'patches' }}
+      KSU_VERSION_CODE: ${{ needs.preflight.outputs.version_code }}
+      BUILD_KPM: ${{ inputs.kpm && 'y' || 'n' }}
+      EXPECTED_SIZE: ${{ inputs.expected_size || '' }}
+      EXPECTED_HASH: ${{ inputs.expected_hash || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 环境自检（镜像 ENV 是编 ko 的全部依赖）
+        run: |
+          set -eux
+          echo "KDIR=$KDIR"
+          echo "ARCH=$ARCH  CROSS_COMPILE=$CROSS_COMPILE  LLVM=$LLVM  LLVM_IAS=$LLVM_IAS"
+          clang --version | head -1
+          llvm-strip --version | head -1
+          test -f "$KDIR/Makefile"
+          test -f "$KDIR/vmlinux" || echo "::warning::$KDIR/vmlinux 不存在，check_symbol 会失败"
+          nproc
+          df -h /  | tail -1
+
+      - name: 打补丁
+        run: |
+          set -eux
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          shopt -s nullglob
+          patches=("$PATCH_DIR"/*.patch)
+          test "${#patches[@]}" -gt 0 || { echo "::error::没有补丁"; exit 1; }
+          for p in "${patches[@]}"; do
+            if git apply --reverse --check "$p" 2>/dev/null; then
+              echo "已应用，跳过：$p"
+            else
+              git apply --verbose "$p"
+              echo "已应用：$p"
+            fi
+          done
+          git --no-pager diff --stat
+
+      - name: 编 kernelsu.ko
+        run: |
+          set -eux
+          cd kernel
+          echo "=== Building kernelsu.ko for KMI: ${KMI} (KSU_VERSION=${KSU_VERSION_CODE}) ==="
+
+          # 与上游 ddk-lkm.yml 完全同构的参数拼装
+          set -- CONFIG_KSU=m "CONFIG_KPM=${BUILD_KPM}" CC=clang "KSU_VERSION=${KSU_VERSION_CODE}"
+          if [ -n "${EXPECTED_SIZE}" ]; then set -- "$@" "KSU_EXPECTED_SIZE=${EXPECTED_SIZE}"; fi
+          if [ -n "${EXPECTED_HASH}" ]; then set -- "$@" "KSU_EXPECTED_HASH=${EXPECTED_HASH}"; fi
+          if [ -n "${GITHUB_REF_NAME:-}" ]; then set -- "$@" "KSU_BUILD_REF=${GITHUB_REF_NAME}"; fi
+
+          make "$@"
+
+          OUT_DIR="${GITHUB_WORKSPACE}/out/aarch64"
+          mkdir -p "$OUT_DIR"
+          cp kernelsu.ko "${OUT_DIR}/${KMI}_kernelsu.ko"
+          llvm-strip -d "${OUT_DIR}/${KMI}_kernelsu.ko"
+          ls -la "$OUT_DIR"
+          du -h "${OUT_DIR}/${KMI}_kernelsu.ko"
+
+      - name: 产物体检（vermagic 硬断言 / 架构 / 关键符号）
+        env:
+          EXPECTED_VERMAGIC: ${{ inputs.expected_vermagic }}
+        run: |
+          set -eu
+          ko="${GITHUB_WORKSPACE}/out/aarch64/${KMI}_kernelsu.ko"
+          got=$(grep -a -o 'vermagic=[^[:cntrl:]]*' "$ko" | head -1 || true)
+          echo "vermagic: $got"
+          if [ -n "${EXPECTED_VERMAGIC:-}" ]; then
+            echo "expected(exact): $EXPECTED_VERMAGIC"
+            [ "$got" = "$EXPECTED_VERMAGIC" ] || { echo "::error::vermagic 精确匹配失败"; exit 1; }
+          else
+            # 设备 6.12.69，DDK kdir 是 6.12.76；patch 级差异由 ksud 安装时处理，
+            # 这里只保证 KMI（6.12.x + 4k）一致。
+            case "$got" in
+              vermagic=6.12.*-4k*) echo "vermagic KMI 校验通过（patch 级差异允许）" ;;
+              *) echo "::error::vermagic KMI 不匹配：$got"; exit 1 ;;
+            esac
+          fi
+          echo "== name/version =="
+          grep -a -o 'name=[^[:cntrl:]]*' "$ko" | head -1 || true
+          grep -a -o 'version=[^[:cntrl:]]*' "$ko" | head -1 || true
+          grep -a -q 'AArch64' "$ko" || { echo "::error::不是 AArch64 产物"; exit 1; }
+          echo "== 补丁标记（gate 函数；可能被内联，缺失只告警） =="
+          if grep -a -q 'ksu_setproc_type_gate' "$ko"; then
+            echo "found: ksu_setproc_type_gate"
+          else
+            echo "::warning::symtab 里没找到 ksu_setproc_type_gate（可能被内联），以设备实测为准"
+          fi
+          echo "== 尺寸 =="
+          stat -c '%s bytes' "$ko"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lkm-${{ inputs.kmi || 'android16-6.12' }}-aarch64-patched
+          path: out/aarch64/*.ko
+          if-no-files-found: error
+          retention-days: 14
+
+  # ==========================================================================
+  # 3) x86_64 LKM：复刻上游 ddk-lkm.yml 的 "Build kernelsu.ko for x64"
+  #    （需要 /opt/ddk/src 里的完整源码 + O= 独立 kdir + modpost 补丁）
+  # ==========================================================================
+  lkm-x86_64:
+    name: LKM ${{ inputs.kmi || 'android16-6.12' }} x86_64
+    needs: preflight
+    if: ${{ inputs.arch == 'x86_64' || inputs.arch == 'both' }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:${{ inputs.kmi || 'android16-6.12' }}-${{ inputs.ddk_release || '20260828' }}
+      options: --privileged
+    env:
+      KMI: ${{ inputs.kmi || 'android16-6.12' }}
+      PATCH_DIR: ${{ inputs.patch_dir || 'patches' }}
+      KSU_VERSION_CODE: ${{ needs.preflight.outputs.version_code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 打补丁
+        run: |
+          set -eux
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          shopt -s nullglob
+          patches=("$PATCH_DIR"/*.patch)
+          test "${#patches[@]}" -gt 0 || { echo "::error::没有补丁"; exit 1; }
+          for p in "${patches[@]}"; do
+            if git apply --reverse --check "$p" 2>/dev/null; then echo "已应用：$p"; else git apply --verbose "$p"; fi
+          done
+
+      - name: 准备 x86 KDIR 并编译
+        run: |
+          set -eux
+          mkdir -p /opt/ddk/kdir-x64
+          unset ARCH CROSS_COMPILE
+          export ARCH=x86_64
+          kmi="$KMI"
+          pushd "/opt/ddk/src/${kmi}"
+          export KDIR="/opt/ddk/kdir-x64/${kmi}"
+
+          MODPOST=scripts/mod/modpost.c
+          sed -i -E 's/^([[:space:]]*)check_exports\(mod\);/\1\/\/ check_exports(mod);/' "$MODPOST"
+          sed -i -E 's/^([[:space:]]*)s->module = exp->module;/\1\/\/ s->module = exp->module;/' "$MODPOST"
+          sed -i 's/^static void check_exports(/static void __attribute__((unused)) check_exports(/' "$MODPOST"
+          sed -i 's/__version_ext_names\\") =\\n/__version_ext_names\\") = \\"\\"\\n/' "$MODPOST"
+
+          make O="$KDIR" gki_defconfig
+          scripts/config --file "$KDIR/.config" -d LTO_CLANG -e LTO_NONE \
+            -d LTO_CLANG_THIN -d LTO_CLANG_FULL -d THINLTO
+          if [ "$kmi" = "android16-6.12" ] || [ "$kmi" = "android17-6.18" ]; then
+            scripts/config --file "$KDIR/.config" -e CONFIG_CFI_ICALL_NORMALIZE_INTEGERS
+          fi
+          make O="$KDIR" modules_prepare
+          make O="$KDIR" security/selinux/built-in.a
+          popd
+
+          cd kernel
+          make clean || true
+          set -- CONFIG_KSU=m CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y "KSU_VERSION=${KSU_VERSION_CODE}"
+          MDIR="$(realpath .)"
+          if [ "$kmi" = "android17-6.18" ]; then
+            make -C "$KDIR" M="$MDIR" MO="$MDIR" compile_commands.json modules "$@"
+          else
+            make -C "$KDIR" M="$MDIR" src="$MDIR" compile_commands.json modules "$@"
+          fi
+
+          OUT_DIR="${GITHUB_WORKSPACE}/out/x86_64"
+          mkdir -p "$OUT_DIR"
+          cp kernelsu.ko "${OUT_DIR}/${KMI}_kernelsu.ko"
+          llvm-strip -d "${OUT_DIR}/${KMI}_kernelsu.ko"
+          ls -la "$OUT_DIR"
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lkm-${{ inputs.kmi || 'android16-6.12' }}-x86_64-patched
+          path: out/x86_64/*.ko
+          if-no-files-found: error
+          retention-days: 14
+
+  # ==========================================================================
+  # 4) manager APK：复刻上游 manager.yml
+  #    风险（README §4 详述）：重签名后与设备上官方 CI 签名不一致 →
+  #    无法覆盖安装；卸载重装会丢已授权列表/模块。默认关闭。
+  # ==========================================================================
+  manager:
+    name: "Manager APK"
+    needs: [preflight]
+    if: ${{ inputs.build_manager }}
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: '29.0.14206865'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "JDK 21 (root build.gradle.kts sets JavaVersion.VERSION_21)"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Gradle 9.7.1（= manager/gradle/wrapper 的 distributionUrl 版本）
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.7.1'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 组件（版本取自 manager/gradle/libs.versions.toml）
+        run: |
+          set -eux
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-37" \
+            "build-tools;37.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Rust + Android target
+        run: |
+          set -eux
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          . "$HOME/.cargo/env"
+          rustup target add aarch64-linux-android
+          cargo --version
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: 编 ksud（等价上游 ksud.yml 的 cargo build aarch64-linux-android）
+        run: |
+          set -eux
+          . "$HOME/.cargo/env"
+          source .github/scripts/setup-rust-build.sh aarch64-linux-android 26
+          cargo build --target aarch64-linux-android --release \
+            --manifest-path ./userspace/ksud/Cargo.toml
+          mkdir -p target/aarch64-linux-android/release
+          ls -la target/aarch64-linux-android/release/ksud
+
+      - name: 写签名配置（无 keystore 则自签临时 key）
+        id: sign
+        env:
+          KS_B64: ${{ inputs.keystore_b64 || '' }}
+          KS_PASS: ${{ inputs.keystore_password || '' }}
+          K_ALIAS: ${{ inputs.key_alias || '' }}
+          K_PASS: ${{ inputs.key_password || '' }}
+        run: |
+          set -eux
+          cd manager
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > key.jks
+            echo "SIGN_STORE=key.jks"          >> "$GITHUB_OUTPUT"
+            echo "SIGN_ALIAS=$K_ALIAS"         >> "$GITHUB_OUTPUT"
+            echo "SIGN_STORE_PASS=$KS_PASS"    >> "$GITHUB_OUTPUT"
+            echo "SIGN_KEY_PASS=$K_PASS"       >> "$GITHUB_OUTPUT"
+            echo "::notice::使用传入的 keystore 签名"
+          else
+            keytool -genkeypair -keystore key.jks -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=DEBUG'
+            echo "SIGN_STORE=key.jks"                  >> "$GITHUB_OUTPUT"
+            echo "SIGN_ALIAS=androiddebugkey"          >> "$GITHUB_OUTPUT"
+            echo "SIGN_STORE_PASS=android"             >> "$GITHUB_OUTPUT"
+            echo "SIGN_KEY_PASS=android"               >> "$GITHUB_OUTPUT"
+            echo "::warning::自签临时 key：与设备已装 manager 签名不同，覆盖安装会失败"
+          fi
+          {
+            echo "KEYSTORE_FILE=key.jks"
+            echo "KEYSTORE_PASSWORD=$([ -n "$KS_B64" ] && echo "$KS_PASS" || echo android)"
+            echo "KEY_ALIAS=$([ -n "$KS_B64" ] && echo "$K_ALIAS" || echo androiddebugkey)"
+            echo "KEY_PASSWORD=$([ -n "$KS_B64" ] && echo "$K_PASS" || echo android)"
+          } >> gradle.properties
+          cat gradle.properties | tail -5
+
+      - name: 随机化打包身份 + 放入 ksud（复刻 manager.yml）
+        run: |
+          set -eux
+          cd manager
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          rand_alpha() { openssl rand -base64 48 | tr -dc 'a-z' | cut -c1-"$1"; }
+          KSUD_LIB="lib$(rand_alpha 10).so"
+          CORE_LIB="$(rand_alpha 11)"
+          APP_CLASS="$(rand_alpha 11)"
+          PRELOAD_CLASS="$(rand_alpha 11)"
+          MAIN_CLASS="$(rand_alpha 11)"
+          WEBUI_CLASS="$(rand_alpha 11)"
+          DOWNLOAD_CLASS="$(rand_alpha 11)"
+          MAGICA_CLASS="$(rand_alpha 11)"
+
+          find app/src/main -type f \
+            \( -name '*.kt' -o -name '*.java' -o -name '*.xml' \
+               -o -name '*.cc' -o -name 'CMakeLists.txt' \) \
+            -exec sed -i \
+              -e "s/\"libksud\.so\"/\"$KSUD_LIB\"/g" \
+              -e "s/project(\"kernelsu\")/project(\"$CORE_LIB\")/" \
+              -e "s/add_library(kernelsu/add_library($CORE_LIB/" \
+              -e "s/target_include_directories(kernelsu /target_include_directories($CORE_LIB /" \
+              -e "s/target_link_libraries(kernelsu /target_link_libraries($CORE_LIB /" \
+              -e "s/loadLibrary(\"kernelsu\")/loadLibrary(\"$CORE_LIB\")/g" \
+              -e "/^[[:space:]]*[*\/]/!s/KernelSUApplication/${APP_CLASS}Application/g" \
+              -e "/^[[:space:]]*[*\/]/!s/AppZygotePreload/${PRELOAD_CLASS}Preload/g" \
+              -e "/^[[:space:]]*[*\/]/!s/MainActivity/${MAIN_CLASS}Activity/g" \
+              -e "/^[[:space:]]*[*\/]/!s/WebUIActivity/${WEBUI_CLASS}Activity/g" \
+              -e "/^[[:space:]]*[*\/]/!s/DownloadService/${DOWNLOAD_CLASS}Service/g" \
+              -e "/^[[:space:]]*[*\/]/!s/MagicaService/${MAGICA_CLASS}Service/g" \
+              {} +
+
+          find app/src/main -depth -type f -name 'KernelSUApplication.kt' -execdir mv {} "${APP_CLASS}Application.kt" \;
+          find app/src/main -depth -type f -name 'AppZygotePreload.java' -execdir mv {} "${PRELOAD_CLASS}Preload.java" \;
+          find app/src/main -depth -type f -name 'MainActivity.kt' -execdir mv {} "${MAIN_CLASS}Activity.kt" \;
+          find app/src/main -depth -type f -name 'MainActivityUiState.kt' -execdir mv {} "${MAIN_CLASS}ActivityUiState.kt" \;
+          find app/src/main -depth -type f -name 'MainActivityViewModel.kt' -execdir mv {} "${MAIN_CLASS}ActivityViewModel.kt" \;
+          find app/src/main -depth -type f -name 'WebUIActivity.kt' -execdir mv {} "${WEBUI_CLASS}Activity.kt" \;
+          find app/src/main -depth -type f -name 'DownloadService.kt' -execdir mv {} "${DOWNLOAD_CLASS}Service.kt" \;
+          find app/src/main -depth -type f -name 'MagicaService.java' -execdir mv {} "${MAGICA_CLASS}Service.java" \;
+
+          echo "Packaged identity: $KSUD_LIB, lib$CORE_LIB.so, ${APP_CLASS}Application"
+          cp -f ../target/aarch64-linux-android/release/ksud "app/src/main/jniLibs/arm64-v8a/$KSUD_LIB"
+
+      - name: Gradle assembleRelease
+        working-directory: ./manager
+        run: |
+          set -eux
+          gradle --version
+          gradle --build-cache -Dorg.gradle.parallel=true assembleRelease
+          ls -la app/build/outputs/apk/release/
+
+      - name: 按 ABI repack + 重签（复刻 manager.yml 的 repack-manager）
+        env:
+          SIGN_STORE: ${{ steps.sign.outputs.SIGN_STORE }}
+          SIGN_ALIAS: ${{ steps.sign.outputs.SIGN_ALIAS }}
+          SIGN_STORE_PASS: ${{ steps.sign.outputs.SIGN_STORE_PASS }}
+          SIGN_KEY_PASS: ${{ steps.sign.outputs.SIGN_KEY_PASS }}
+        run: |
+          set -eux
+          apk=$(find manager/app/build/outputs/apk/release -name '*.apk' | head -1)
+          test -n "$apk"
+          mkdir -p target/aarch64-linux-android/release dist
+          python3 repack_apk.py repack \
+            -b release -t release \
+            -a arm64-v8a \
+            -K "manager/$SIGN_STORE" \
+            -A "$SIGN_ALIAS" \
+            -P "$SIGN_STORE_PASS" \
+            -S "$SIGN_KEY_PASS" \
+            --strip \
+            --output-name "SukiSU-patched"
+          ls -la dist/
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: manager-apk-patched
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
