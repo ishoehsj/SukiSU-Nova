@@ -1,0 +1,244 @@
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+index 1e4ee63..00c9058 100644
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -237,9 +237,165 @@ static u32 ptrace_parent_sid(void)
+     return sid;
+ }
+ 
++/*
++ * selinux_setprocattr() A/B timing equalization.
++ *
++ * Side-channel probes (Duck / Maple) write two same-length payloads to
++ * /proc/thread-self/attr/current and compare the cost of the two writes:
++ *
++ *   A = "u:r:__selinux_hide_probe_invalid__:s0"   (unknown type)
++ *   B = "\n:r:__selinux_hide_probe_invalid__:s0"  (first byte is a newline)
++ *
++ * Stock returns -EINVAL for both, but through different work: A fails in
++ * security_context_to_sid(), B skips conversion because of the leading
++ * newline and only fails on the empty SID after prepare_creds().  The hook
++ * kept that split, so A paid a backup-policy parse while B paid a cred
++ * round-trip; here that became a stable +51..+104 ns A-slower signal.
++ *
++ * The guard below removes the split.  The payload is copied once (value is
++ * never written to), a trailing newline is stripped, and the type field - the
++ * only field the two payloads share byte for byte - is looked up in the same
++ * policy the conversion uses.  Both payloads then execute the same
++ * instructions and the same single symtab probe, and both return -EINVAL
++ * before any cred is allocated.  A zero return only means "let the real
++ * conversion decide": user, role, MLS and role/type validity are still
++ * checked by security_context_to_sid_live(), and the EAGAIN dual parse is
++ * unchanged, so a valid context still changes the current SID as before.
++ */
++#define KSU_SETPROC_CTX_MAX 4096
++#define KSU_SETPROC_CTX_STACK 256
++#define KSU_SETPROC_TYPE_MAX 128
++
++struct ksu_setproc_ctx {
++    char *p;
++    bool heap;
++    char stack[KSU_SETPROC_CTX_STACK];
++};
++
++static void ksu_setproc_ctx_release(struct ksu_setproc_ctx *ctx)
++{
++    if (ctx->heap)
++        kfree(ctx->p);
++}
++
++/*
++ * Copy the attribute payload into private memory.  value belongs to the
++ * caller and may be read-only, so it is never modified, and nothing here
++ * depends on value being NUL terminated.  A single trailing newline is
++ * stripped; the stripped length is reported so write() keeps stock's return
++ * value.
++ */
++static int ksu_setproc_ctx_prepare(const void *value, size_t size, struct ksu_setproc_ctx *ctx, u32 *ctx_len)
++{
++    if (!size || !value)
++        return -EINVAL;
++
++    if (size < sizeof(ctx->stack)) {
++        ctx->p = ctx->stack;
++        ctx->heap = false;
++    } else {
++        ctx->p = kmalloc(size + 1, GFP_KERNEL);
++        if (!ctx->p)
++            return -ENOMEM;
++        ctx->heap = true;
++    }
++
++    memcpy(ctx->p, value, size);
++
++    if (ctx->p[size - 1] == '\n')
++        size--;
++    ctx->p[size] = '\0';
++
++    if (!size) {
++        ksu_setproc_ctx_release(ctx);
++        return -EINVAL;
++    }
++
++    *ctx_len = (u32)size;
++    return 0;
++}
++
++/*
++ * Validate the type field (third ':' separated field) against the policy used
++ * by the conversion below.  This is the cheap half of string_to_context_struct()
++ * and the only check both probe payloads can reach identically.  Unknown and
++ * attribute types are rejected with the same -EINVAL the full parser returns.
++ */
++static int ksu_setproc_type_gate(const char *scontext, u32 scontext_len, struct selinux_policy *policy)
++{
++    const char *p = scontext, *end = scontext + scontext_len;
++    struct type_datum *typdatum;
++    char type[KSU_SETPROC_TYPE_MAX];
++    size_t len = 0;
++    int i;
++
++    for (i = 0; i < 2; i++) {
++        while (p < end && *p != ':')
++            p++;
++        if (p == end)
++            return -EINVAL;
++        p++;
++    }
++
++    while (p < end && *p != ':' && len < sizeof(type) - 1)
++        type[len++] = *p++;
++    if (!len)
++        return -EINVAL;
++    if (p < end && *p != ':')
++        return 0; /* overlong type name: leave the decision to the full parser */
++    type[len] = '\0';
++
++    typdatum = symtab_search(&policy->policydb.p_types, type);
++    if (!typdatum || typdatum->attribute)
++        return -EINVAL;
++
++    return 0;
++}
++
++/*
++ * Normalize, guard and convert in one place, so that every failure before
++ * prepare_creds() is returned from here with the payload-independent cost.
++ * On success *sid is the SID to commit and *ctx_len is the length stock would
++ * have returned from write().
++ */
++static int ksu_setproc_context_lookup(const void *value, size_t size, struct selinux_policy *policy, u32 *ctx_len,
++                                      u32 *sid)
++{
++    struct ksu_setproc_ctx ctx;
++    int error;
++
++    error = ksu_setproc_ctx_prepare(value, size, &ctx, ctx_len);
++    if (error)
++        return error;
++
++    error = ksu_setproc_type_gate(ctx.p, *ctx_len, policy);
++    if (!error) {
++        error = security_context_to_sid_live(ctx.p, *ctx_len, sid);
++        if (error == -EAGAIN) {
++            // stale type mark, use the dual parse
++            u32 tmp_sid = 0;
++            int error2;
++
++            error2 = security_context_to_sid_with_policy(policy, ctx.p, *ctx_len, &tmp_sid, SECSID_NULL, GFP_KERNEL,
++                                                         sid, &error);
++            if (error2 || error)
++                error = error2 ?: error;
++        }
++    }
++
++    ksu_setproc_ctx_release(&ctx);
++    return error;
++}
++
+ typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
+ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+ {
++    struct ksu_task_security_struct *tsec;
++    struct selinux_policy *policy;
++    struct cred *new;
++    u32 mysid, sid = 0, ptsid, ctx_len = 0;
++    int error;
++
+     if (likely(current_uid().val < 10000)) {
+         goto call_orig;
+     }
+@@ -248,33 +404,32 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+         goto call_orig;
+     }
+ 
+-    struct ksu_task_security_struct *tsec;
+-    struct cred *new;
+-    u32 mysid = current_sid(), sid = 0, tmp_sid, ptsid;
+-    int error, error2;
+-    char *str = value;
++    policy = READ_ONCE(backup_sepolicy);
++    if (unlikely(!policy || IS_ERR(policy))) {
++        // the hook is only installed while a valid backup policy is in place
++        goto call_orig;
++    }
++
++    // out of the probe range: keep stock behavior instead of rejecting
++    if (unlikely(size > KSU_SETPROC_CTX_MAX)) {
++        goto call_orig;
++    }
++
++    mysid = current_sid();
+ 
+     error = ksu_avc_has_perm_compat(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
+     if (error)
+         return error;
+ 
+-    /* Obtain a SID for the context, if one was specified. */
+-    if (size && str[0] && str[0] != '\n') {
+-        if (str[size - 1] == '\n') {
+-            str[size - 1] = 0;
+-            size--;
+-        }
+-        error = security_context_to_sid_live(value, size, &sid);
+-        if (error == -EAGAIN) {
+-            // stale type mark, use the dual parse
+-            error2 = security_context_to_sid_with_policy(backup_sepolicy, value, size, &tmp_sid, SECSID_NULL,
+-                                                         GFP_KERNEL, &sid, &error);
+-            if (error2 || error)
+-                return error2 ?: error;
+-        } else if (error) {
+-            return error;
+-        }
+-    }
++    // same guard and same conversion for every payload; every failure below
++    // returns here, before prepare_creds(), with the same cost for A and B
++    error = ksu_setproc_context_lookup(value, size, policy, &ctx_len, &sid);
++    if (error)
++        return error;
++
++    // stock rejects an empty SID; a successful conversion always yields one
++    if (unlikely(!sid))
++        return -EINVAL;
+ 
+     new = prepare_creds();
+     if (!new)
+@@ -287,9 +442,6 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+ 	   checks and may_create for the file creation checks. The
+ 	   operation will then fail if the context is not permitted. */
+     tsec = selinux_cred(new);
+-    error = -EINVAL;
+-    if (sid == 0)
+-        goto abort_change;
+ 
+     if (!current_is_single_threaded()) {
+         error = ksu_security_bounded_transition_compat(tsec->sid, sid);
+@@ -314,7 +466,7 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+     tsec->sid = sid;
+ 
+     commit_creds(new);
+-    return size;
++    return (int)ctx_len;
+ 
+ abort_change:
+     abort_creds(new);
