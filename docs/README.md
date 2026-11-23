@@ -20,6 +20,7 @@ A kernel-based root solution for Android, evolved from [`tiann/KernelSU`](https:
 6. Kernel Extension Center: CPU/vvar spoofing, AVC log spoofing, version spoofing, SUSFS and mount view hiding — all in one place.
 7. Built-in SUSFS management tools with one-tap root hiding configuration.
 8. Dual UI: Miuix / Material 3 Expressive; supports Miuix splash screen, module banners and sorting, temporary root grant, and kernel-free preview.
+9. **Timing-jitter controller**: A/B equalization plus randomized jitter and a directional bias for selinux_hide - see [timing-jitter.md](timing-jitter.md); userspace module at [kernel-jitter](https://github.com/ishoehsj/kernel-jitter).
 
 ## Compatibility
 
