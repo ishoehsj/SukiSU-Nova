@@ -20,6 +20,7 @@
 6. 内核扩展中心：CPU/vvar 伪装、AVC 日志伪装、版本伪装、SUSFS 与挂载视图隐藏，集中在一个入口。
 7. 内置 SUSFS 管理工具，支持一键配置 Root 隐藏。
 8. Miuix / Material 3 Expressive 双界面；支持 Miuix 开屏、模块横幅与排序、临时 Root 授权与无内核预览。
+9. **时序抖动控制器**：selinux_hide 的 A/B 时序等值化 + 随机抖动 + 定向偏置，详见 [timing-jitter.md](timing-jitter.md)；用户态模块见 [kernel-jitter](https://github.com/ishoehsj/kernel-jitter)。
 
 ## 兼容状态
 
