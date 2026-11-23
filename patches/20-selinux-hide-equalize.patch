@@ -1,8 +1,8 @@
 diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
-index 1e4ee63..00c9058 100644
+index 1e4ee63..4287251 100644
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -237,9 +237,165 @@ static u32 ptrace_parent_sid(void)
+@@ -237,9 +237,192 @@ static u32 ptrace_parent_sid(void)
      return sid;
  }
  
@@ -156,6 +156,33 @@ index 1e4ee63..00c9058 100644
 +    return error;
 +}
 +
++/*
++ * Probe equalisation jitter.
++ *
++ * A caller can time two payloads and read the difference straight out of the
++ * counters: one payload stops early in ksu_setproc_type_gate(), the other walks
++ * the whole conversion, and the delta is a stable one to two timer ticks. A
++ * pseudo-random spin on every probe visible exit spreads that delta across a
++ * window an order of magnitude wider, so the per-call ordering stops carrying
++ * signal and a direction counter drifts back to a coin flip.
++ */
++#define KSU_SETPROC_JITTER_TICKS 16
++
++static inline void ksu_setproc_jitter(void)
++{
++#if defined(CONFIG_ARM64)
++    u64 start, now;
++    u32 delay;
++
++    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(start));
++    delay = (u32)((start * 0x9E3779B97F4A7C15ULL) >> 60);
++
++    do {
++        asm volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
++    } while ((now - start) < (u64)delay);
++#endif
++}
++
  typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
  static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
  {
@@ -168,7 +195,7 @@ index 1e4ee63..00c9058 100644
      if (likely(current_uid().val < 10000)) {
          goto call_orig;
      }
-@@ -248,33 +404,32 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -248,37 +431,44 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
          goto call_orig;
      }
  
@@ -191,8 +218,11 @@ index 1e4ee63..00c9058 100644
 +    mysid = current_sid();
  
      error = ksu_avc_has_perm_compat(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
-     if (error)
+-    if (error)
++    if (error) {
++        ksu_setproc_jitter();
          return error;
++    }
  
 -    /* Obtain a SID for the context, if one was specified. */
 -    if (size && str[0] && str[0] != '\n') {
@@ -210,20 +240,30 @@ index 1e4ee63..00c9058 100644
 -        } else if (error) {
 -            return error;
 -        }
--    }
 +    // same guard and same conversion for every payload; every failure below
 +    // returns here, before prepare_creds(), with the same cost for A and B
 +    error = ksu_setproc_context_lookup(value, size, policy, &ctx_len, &sid);
-+    if (error)
++    if (error) {
++        ksu_setproc_jitter();
 +        return error;
++    }
 +
 +    // stock rejects an empty SID; a successful conversion always yields one
-+    if (unlikely(!sid))
++    if (unlikely(!sid)) {
++        ksu_setproc_jitter();
 +        return -EINVAL;
+     }
  
      new = prepare_creds();
-     if (!new)
-@@ -287,9 +442,6 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+-    if (!new)
++    if (!new) {
++        ksu_setproc_jitter();
+         return -ENOMEM;
++    }
+ 
+     /* Permission checking based on the specified context is
+ 	   performed during the actual operation (execve,
+@@ -287,9 +477,6 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
  	   checks and may_create for the file creation checks. The
  	   operation will then fail if the context is not permitted. */
      tsec = selinux_cred(new);
@@ -233,12 +273,17 @@ index 1e4ee63..00c9058 100644
  
      if (!current_is_single_threaded()) {
          error = ksu_security_bounded_transition_compat(tsec->sid, sid);
-@@ -314,7 +466,7 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -314,10 +501,12 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
      tsec->sid = sid;
  
      commit_creds(new);
 -    return size;
++    ksu_setproc_jitter();
 +    return (int)ctx_len;
  
  abort_change:
      abort_creds(new);
++    ksu_setproc_jitter();
+     return error;
+ 
+ call_orig:
