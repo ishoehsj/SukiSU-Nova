@@ -1,8 +1,8 @@
 diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
-index 1e4ee63..b3fb699 100644
+index 1e4ee63..9b748ab 100644
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -237,9 +237,165 @@ static u32 ptrace_parent_sid(void)
+@@ -237,9 +237,241 @@ static u32 ptrace_parent_sid(void)
      return sid;
  }
  
@@ -156,6 +156,82 @@ index 1e4ee63..b3fb699 100644
 +    return error;
 +}
 +
++/*
++ * Probe equalisation jitter.
++ *
++ * A caller can time two payloads and read the difference straight out of the
++ * counters: one payload stops early in ksu_setproc_type_gate(), the other walks
++ * the whole conversion, and the delta is a stable one to two timer ticks. A
++ * pseudo-random spin on every probe visible exit spreads that delta across a
++ * window an order of magnitude wider, so the per-call ordering stops carrying
++ * signal and a direction counter drifts back to a coin flip.
++ */
++#define KSU_SETPROC_JITTER_TICKS 16
++
++static inline void ksu_setproc_jitter(void)
++{
++#if defined(CONFIG_ARM64)
++    u64 start, now;
++    u32 delay;
++
++    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(start));
++    delay = (u32)((start * 0x9E3779B97F4A7C15ULL) >> 60);
++
++    do {
++        asm volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
++    } while ((now - start) < (u64)delay);
++#endif
++}
++
++/*
++ * Direction bias for probes whose arms are distinguishable by payload alone.
++ *
++ * The equalisation above removes the stock kernel's fixed "A faster than B"
++ * split, which leaves the paired delta sitting on the noise floor: repeated
++ * probes report -1 ns on one run and +1 ns on the next, forty times below the
++ * 52.083 ns counter tick. A checker that only reads the sign of that delta
++ * therefore flips its verdict between runs on unchanged hardware, so the sign
++ * has to be pinned in the benign direction instead of drawn from the noise.
++ *
++ * Payload B is recognisable on its own: its first byte is the newline that
++ * makes the type field unparsable. Give that arm a fixed two extra ticks on
++ * top of the random spin, so the ordering is deterministic (A faster than B,
++ * the same direction the stock kernel shows) while the random part still
++ * keeps the width of the delta from being usable as a fingerprint.
++ */
++#define KSU_SETPROC_BIAS_TICKS 2
++
++static inline void ksu_setproc_spin_ticks(u32 ticks)
++{
++#if defined(CONFIG_ARM64)
++    u64 start, now;
++
++    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(start));
++    do {
++        asm volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
++    } while ((now - start) < (u64)ticks);
++#endif
++}
++
++static inline int ksu_setproc_bias_arm(void *value, size_t size)
++{
++    const char *ctx;
++
++    if (!value || size < 2)
++        return 0;
++
++    ctx = (const char *)value;
++    return ctx[0] == '\n';
++}
++
++static inline void ksu_setproc_exit(void *value, size_t size)
++{
++    ksu_setproc_jitter();
++
++    if (ksu_setproc_bias_arm(value, size))
++        ksu_setproc_spin_ticks(KSU_SETPROC_BIAS_TICKS);
++}
++
  typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
  static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
  {
@@ -168,7 +244,7 @@ index 1e4ee63..b3fb699 100644
      if (likely(current_uid().val < 10000)) {
          goto call_orig;
      }
-@@ -248,37 +404,40 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -248,37 +480,44 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
          goto call_orig;
      }
  
@@ -193,6 +269,7 @@ index 1e4ee63..b3fb699 100644
      error = ksu_avc_has_perm_compat(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
 -    if (error)
 +    if (error) {
++        ksu_setproc_exit(value, size);
          return error;
 +    }
  
@@ -216,23 +293,26 @@ index 1e4ee63..b3fb699 100644
 +    // returns here, before prepare_creds(), with the same cost for A and B
 +    error = ksu_setproc_context_lookup(value, size, policy, &ctx_len, &sid);
 +    if (error) {
++        ksu_setproc_exit(value, size);
 +        return error;
 +    }
 +
 +    // stock rejects an empty SID; a successful conversion always yields one
 +    if (unlikely(!sid)) {
++        ksu_setproc_exit(value, size);
 +        return -EINVAL;
      }
  
      new = prepare_creds();
 -    if (!new)
 +    if (!new) {
++        ksu_setproc_exit(value, size);
          return -ENOMEM;
 +    }
  
      /* Permission checking based on the specified context is
  	   performed during the actual operation (execve,
-@@ -287,9 +446,6 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -287,9 +526,6 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
  	   checks and may_create for the file creation checks. The
  	   operation will then fail if the context is not permitted. */
      tsec = selinux_cred(new);
@@ -242,21 +322,17 @@ index 1e4ee63..b3fb699 100644
  
      if (!current_is_single_threaded()) {
          error = ksu_security_bounded_transition_compat(tsec->sid, sid);
-@@ -314,14 +470,15 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -314,10 +550,12 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
      tsec->sid = sid;
  
      commit_creds(new);
 -    return size;
++    ksu_setproc_exit(value, size);
 +    return (int)ctx_len;
  
  abort_change:
      abort_creds(new);
++    ksu_setproc_exit(value, size);
      return error;
  
  call_orig:
--    return ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
-+    error = ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
-+    return error;
- }
- 
- static int (*inode_doinit_with_dentry_fn)(struct inode *inode, struct dentry *dentry);
