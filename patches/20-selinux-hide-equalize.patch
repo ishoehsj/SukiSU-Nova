@@ -1,8 +1,8 @@
 diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
-index 1e4ee63..0973b6a 100644
+index 1e4ee63..cced166 100644
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -237,9 +237,220 @@ static u32 ptrace_parent_sid(void)
+@@ -237,9 +237,217 @@ static u32 ptrace_parent_sid(void)
      return sid;
  }
  
@@ -167,21 +167,25 @@ index 1e4ee63..0973b6a 100644
 + * signal and a direction counter drifts back to a coin flip.
 + */
 +/*
-+ * Counter quantum equalisation.
++ * Wide probe jitter.
 + *
-+ * Both arms of a probe finish a few hundred nanoseconds apart, far below one
-+ * scheduler slice, yet the delta is a stable one to two timer ticks: enough for
-+ * a checker that only reads the sign or the direction of the paired delta.
-+ * Random spin only widens the distribution and leaves the median wherever the
-+ * code paths put it, so every probe visible exit instead rounds its own elapsed
-+ * counter value up to the next multiple of KSU_SETPROC_QUANTUM_TICKS. Two arms
-+ * that finish inside the same quantum report exactly the same duration, and a
-+ * pair that straddles a boundary differs by one whole quantum in either
-+ * direction, never by a one tick code-path remainder.
++ * A probe splits its payload pair by construction: A is a well formed context
++ * that walks the whole conversion, B is the same bytes behind a newline and
++ * stops a few hundred nanoseconds earlier. Whatever the code does with those
++ * two payloads, that remainder is a stable one to two timer ticks and a checker
++ * that counts directions reads it straight out of the counters.
++ *
++ * Equalising the two paths is not enough on its own: the remainder moves to
++ * whichever branch happens to be longer, and the counter still sees a bias.
++ * Instead, every probe visible exit adds an independent pseudo-random spin an
++ * order of magnitude wider than the remainder, so the measured delta becomes
++ * noise dominated. The per pair ordering then carries no signal: the direction
++ * counters converge on a coin flip and the payload a caller chose stops being
++ * recoverable from the timing at all.
 + */
-+#define KSU_SETPROC_QUANTUM_TICKS 4
++#define KSU_SETPROC_JITTER_TICKS 96
 +
-+static inline u64 ksu_setproc_stamp(void)
++static inline u64 ksu_setproc_tick(void)
 +{
 +    u64 now = 0;
 +
@@ -191,22 +195,16 @@ index 1e4ee63..0973b6a 100644
 +    return now;
 +}
 +
-+static inline void ksu_setproc_align(u64 t0)
++static inline void ksu_setproc_jitter(void)
 +{
 +#if defined(CONFIG_ARM64)
-+    u64 now, elapsed, target;
-+
-+    if (unlikely(!t0))
-+        return;
++    u64 start = ksu_setproc_tick();
++    u64 target = start + (u64)((start * 0x9E3779B97F4A7C15ULL) >> 58);
++    u64 now;
 +
 +    do {
-+        asm volatile("isb; mrs %0, cntvct_el0" : "=r"(now));
-+        elapsed = now - t0;
-+        target = (elapsed + KSU_SETPROC_QUANTUM_TICKS - 1) &
-+                 ~(u64)(KSU_SETPROC_QUANTUM_TICKS - 1);
-+    } while (elapsed < target);
-+#else
-+    (void)t0;
++        now = ksu_setproc_tick();
++    } while (now < target);
 +#endif
 +}
 +
@@ -218,12 +216,11 @@ index 1e4ee63..0973b6a 100644
 +    struct cred *new;
 +    u32 mysid, sid = 0, ptsid, ctx_len = 0;
 +    int error;
-+    u64 ksu_t0 = ksu_setproc_stamp();
 +
      if (likely(current_uid().val < 10000)) {
          goto call_orig;
      }
-@@ -248,37 +459,44 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -248,37 +456,44 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
          goto call_orig;
      }
  
@@ -248,7 +245,7 @@ index 1e4ee63..0973b6a 100644
      error = ksu_avc_has_perm_compat(mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
 -    if (error)
 +    if (error) {
-+        ksu_setproc_align(ksu_t0);
++        ksu_setproc_jitter();
          return error;
 +    }
  
@@ -272,26 +269,26 @@ index 1e4ee63..0973b6a 100644
 +    // returns here, before prepare_creds(), with the same cost for A and B
 +    error = ksu_setproc_context_lookup(value, size, policy, &ctx_len, &sid);
 +    if (error) {
-+        ksu_setproc_align(ksu_t0);
++        ksu_setproc_jitter();
 +        return error;
 +    }
 +
 +    // stock rejects an empty SID; a successful conversion always yields one
 +    if (unlikely(!sid)) {
-+        ksu_setproc_align(ksu_t0);
++        ksu_setproc_jitter();
 +        return -EINVAL;
      }
  
      new = prepare_creds();
 -    if (!new)
 +    if (!new) {
-+        ksu_setproc_align(ksu_t0);
++        ksu_setproc_jitter();
          return -ENOMEM;
 +    }
  
      /* Permission checking based on the specified context is
  	   performed during the actual operation (execve,
-@@ -287,9 +505,6 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -287,9 +502,6 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
  	   checks and may_create for the file creation checks. The
  	   operation will then fail if the context is not permitted. */
      tsec = selinux_cred(new);
@@ -301,23 +298,23 @@ index 1e4ee63..0973b6a 100644
  
      if (!current_is_single_threaded()) {
          error = ksu_security_bounded_transition_compat(tsec->sid, sid);
-@@ -314,14 +529,18 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -314,14 +526,18 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
      tsec->sid = sid;
  
      commit_creds(new);
 -    return size;
-+    ksu_setproc_align(ksu_t0);
++    ksu_setproc_jitter();
 +    return (int)ctx_len;
  
  abort_change:
      abort_creds(new);
-+    ksu_setproc_align(ksu_t0);
++    ksu_setproc_jitter();
      return error;
  
  call_orig:
 -    return ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
 +    error = ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
-+    ksu_setproc_align(ksu_t0);
++    ksu_setproc_jitter();
 +    return error;
  }
  
